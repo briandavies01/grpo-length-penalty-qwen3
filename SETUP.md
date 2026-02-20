@@ -10,9 +10,9 @@ Install PyTorch first, pinned to the version vLLM expects:
 pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-## 2. Install vLLM (must be 0.10.x)
+## 2. Install vLLM (pinned by TRL compatibility)
 
-**vLLM 0.10.2 is required — do not upgrade to 0.11+.** The training code uses `model_impl="transformers"` (which tells vLLM to use HuggingFace kernels instead of its own — needed for correct Qwen3 generation quality) and forces the V0 engine via `VLLM_USE_V1=0` (because V1 has `torch.compile` bugs with the transformers backend). vLLM 0.11 removed the V0 engine entirely, so `VLLM_USE_V1=0` is silently ignored and `model_impl="transformers"` breaks on the V1 engine. Version 0.10.2 is the last release where this combination works.
+**vLLM 0.10.2 is required.** This is constrained by TRL, not our code — TRL 0.28.0 only supports vLLM 0.10.2, 0.11.0–0.11.2, and 0.12.0. Our code additionally sets `VLLM_USE_V1=0` to force the V0 engine (which avoids `torch.compile` bugs with the `model_impl="transformers"` backend on 0.10.x), but the primary version constraint comes from TRL's internal vLLM integration. Upgrading to vLLM 0.15+ would require a newer TRL version and likely changes to `config.py`'s `GRPOConfig` kwargs.
 
 Install vLLM **before** other HF packages to avoid dependency conflicts:
 
@@ -117,7 +117,7 @@ pip install --force-reinstall --no-deps transformers==5.2.0
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-**vLLM version too new (0.11+)** — If you accidentally install vLLM >= 0.11, the V0 engine no longer exists and `VLLM_USE_V1=0` is ignored. You'll see `torch.compile` errors or `model_impl="transformers"` failures. Downgrade: `pip install vllm==0.10.2`.
+**vLLM version too new** — TRL 0.28.0 only supports vLLM 0.10.2–0.12.0. If you install a newer version, TRL's vLLM integration will break. Downgrade: `pip install vllm==0.10.2`.
 
 **`all_special_tokens_extended` AttributeError** — This is a vLLM 0.10.x + transformers 5.x incompatibility. The training scripts monkey-patch it automatically; for standalone vLLM usage, either downgrade transformers or apply the same patch.
 
