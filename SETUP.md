@@ -12,7 +12,7 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https
 
 ## 2. Install vLLM (pinned by TRL compatibility)
 
-**vLLM 0.10.2 is required.** This is constrained by TRL, not our code — TRL 0.28.0 only supports vLLM 0.10.2, 0.11.0–0.11.2, and 0.12.0. Our code additionally sets `VLLM_USE_V1=0` to force the V0 engine (which avoids `torch.compile` bugs with the `model_impl="transformers"` backend on 0.10.x), but the primary version constraint comes from TRL's internal vLLM integration. Upgrading to vLLM 0.15+ would require a newer TRL version and likely changes to `config.py`'s `GRPOConfig` kwargs.
+**vLLM 0.10.2 is required.** TRL 0.28.0 pins `vllm>=0.10.2,<0.13.0` in its dependencies, so anything from 0.10.2 through 0.12.x is allowed by TRL. We use 0.10.2 because our code also sets `VLLM_USE_V1=0` to force the V0 engine (avoiding `torch.compile` bugs with the `model_impl="transformers"` backend), and V0 was removed in 0.11+. If you want to use 0.11–0.12, you'd need to remove the `VLLM_USE_V1=0` lines and test whether `model_impl="transformers"` works on V1 at that version. Upgrading past 0.12 would require a newer TRL.
 
 Install vLLM **before** other HF packages to avoid dependency conflicts:
 
@@ -117,7 +117,7 @@ pip install --force-reinstall --no-deps transformers==5.2.0
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-**vLLM version too new** — TRL 0.28.0 only supports vLLM 0.10.2–0.12.0. If you install a newer version, TRL's vLLM integration will break. Downgrade: `pip install vllm==0.10.2`.
+**vLLM version too new** — TRL 0.28.0 requires `vllm>=0.10.2,<0.13.0`. If you install 0.13+, TRL's vLLM integration will break. Downgrade: `pip install vllm==0.10.2`.
 
 **`all_special_tokens_extended` AttributeError** — This is a vLLM 0.10.x + transformers 5.x incompatibility. The training scripts monkey-patch it automatically; for standalone vLLM usage, either downgrade transformers or apply the same patch.
 
