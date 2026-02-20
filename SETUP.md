@@ -10,9 +10,11 @@ Install PyTorch first, pinned to the version vLLM expects:
 pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-## 2. Install vLLM
+## 2. Install vLLM (must be 0.10.x)
 
-vLLM must be installed **before** other HF packages to avoid dependency conflicts:
+**vLLM 0.10.2 is required — do not upgrade to 0.11+.** The training code uses `model_impl="transformers"` (which tells vLLM to use HuggingFace kernels instead of its own — needed for correct Qwen3 generation quality) and forces the V0 engine via `VLLM_USE_V1=0` (because V1 has `torch.compile` bugs with the transformers backend). vLLM 0.11 removed the V0 engine entirely, so `VLLM_USE_V1=0` is silently ignored and `model_impl="transformers"` breaks on the V1 engine. Version 0.10.2 is the last release where this combination works.
+
+Install vLLM **before** other HF packages to avoid dependency conflicts:
 
 ```bash
 pip install vllm==0.10.2
@@ -115,7 +117,7 @@ pip install --force-reinstall --no-deps transformers==5.2.0
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-**vLLM V1 engine errors** — The scripts set `VLLM_USE_V1=0` automatically. If you see `torch.compile` errors, make sure this env var is set before any vLLM imports.
+**vLLM version too new (0.11+)** — If you accidentally install vLLM >= 0.11, the V0 engine no longer exists and `VLLM_USE_V1=0` is ignored. You'll see `torch.compile` errors or `model_impl="transformers"` failures. Downgrade: `pip install vllm==0.10.2`.
 
 **`all_special_tokens_extended` AttributeError** — This is a vLLM 0.10.x + transformers 5.x incompatibility. The training scripts monkey-patch it automatically; for standalone vLLM usage, either downgrade transformers or apply the same patch.
 
