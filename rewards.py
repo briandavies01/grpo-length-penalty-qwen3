@@ -58,6 +58,15 @@ def extract_answer_text(
     return answer
 
 
+def _normalize_latex(text: str) -> str:
+    """Normalize LaTeX formatting differences that don't change mathematical meaning."""
+    # \dfrac → \frac (display vs inline — mathematically identical)
+    text = text.replace("\\dfrac", "\\frac")
+    # Strip trailing percentage signs — we compare the numeric value
+    text = text.rstrip().removesuffix("\\%").removesuffix("%").rstrip()
+    return text
+
+
 def check_correctness(
     completion_text: str,
     ground_truth: str,
@@ -76,12 +85,16 @@ def check_correctness(
     if not answer_text.strip():
         return 0.0
 
+    # Normalize formatting differences (\dfrac→\frac, strip %)
+    ground_truth_norm = _normalize_latex(ground_truth)
+    answer_text_norm = answer_text.replace("\\dfrac", "\\frac")
+
     try:
         # Parse ground truth — wrap in \boxed{} so math-verify's LaTeX
         # extractor handles all expressions (sqrt, pi, etc.) correctly.
         # Without the wrapper, parse() fails on e.g. "3\sqrt{3}" or "2\pi".
         gold_parsed = parse(
-            r"\boxed{" + ground_truth + "}",
+            r"\boxed{" + ground_truth_norm + "}",
             extraction_config=[
                 LatexExtractionConfig(),
                 ExprExtractionConfig(),
@@ -92,7 +105,7 @@ def check_correctness(
 
         # Parse model answer — prioritize \boxed{} matches
         answer_parsed = parse(
-            answer_text,
+            answer_text_norm,
             extraction_config=[
                 LatexExtractionConfig(
                     boxed_match_priority=0,
