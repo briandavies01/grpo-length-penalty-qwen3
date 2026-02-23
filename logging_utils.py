@@ -160,7 +160,8 @@ class StepSyncCallback(TrainerCallback):
 class CheckpointEvalCallback(TrainerCallback):
     """Runs lightweight eval on a fixed problem set every checkpoint save.
 
-    Uses HF generate (not vLLM) with greedy decoding in batches of 4.
+    Uses the trainer's vLLM instance (if available) for fast generation with
+    continuous batching. Falls back to HF generate if vLLM is not available.
     Logs accuracy and token length stats to W&B and JSONL.
     """
 
@@ -172,62 +173,110 @@ class CheckpointEvalCallback(TrainerCallback):
         self.trainer = None  # Set after trainer creation
         self._eval_fh = open(self.log_dir / "eval_stats.jsonl", "a", encoding="utf-8")
 
-    def on_save(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ):
-        if self.trainer is None:
-            return
+    def _generate_vllm(self, prompts, answers):
+        """Generate completions using the trainer's vLLM instance."""
+        from vllm import SamplingParams
 
-        step = state.global_step
-        print(f"\n[Eval] Running checkpoint eval at step {step} on {len(self.eval_dataset)} problems...")
-        t0 = time.time()
+        vllm_gen = self.trainer.vllm_generation
+        # Sync current LoRA weights to vLLM before generating
+        vllm_gen.sync_weights()
 
-        model = self.trainer.model
-        was_training = model.training
-        model.eval()
+        sampling_params = SamplingParams(
+            temperature=0,  # Greedy
+            max_tokens=self.max_completion_length,
+            stop_token_ids=[151645, 151643],  # im_end, eos
+        )
+
+        # vLLM handles all 100 prompts at once with continuous batching
+        outputs = vllm_gen.llm.generate(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
 
         all_correct = []
         all_num_tokens = []
-        batch_size = 4
+        for i, output in enumerate(outputs):
+            completion = output.outputs[0].text
+            num_tokens = len(output.outputs[0].token_ids)
+            all_correct.append(check_correctness(completion, answers[i]))
+            all_num_tokens.append(num_tokens)
+
+        return all_correct, all_num_tokens
+
+    def _generate_hf(self, model, prompts, answers):
+        """Fallback: generate with HF generate in batches with OOM retry."""
+        all_correct = []
+        all_num_tokens = []
+        batch_size = 50
+
+        with torch.no_grad():
+            i = 0
+            while i < len(prompts):
+                batch_prompts = prompts[i : i + batch_size]
+                batch_answers = answers[i : i + batch_size]
+
+                try:
+                    inputs = self.tokenizer(
+                        batch_prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                    ).to(model.device)
+
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=self.max_completion_length,
+                        do_sample=False,
+                    )
+
+                    prompt_len = inputs["input_ids"].shape[1]
+                    for j, output in enumerate(outputs):
+                        gen_ids = output[prompt_len:]
+                        completion = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                        all_correct.append(check_correctness(completion, batch_answers[j]))
+                        all_num_tokens.append(len(gen_ids))
+                    i += batch_size
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    batch_size = max(batch_size // 2, 1)
+                    print(f"[Eval] OOM, reducing batch size to {batch_size}")
+
+        return all_correct, all_num_tokens
+
+    def _run_eval(self, step: int):
+        """Run eval on the fixed problem set and log results.
+
+        Tries vLLM first (fast, ~1-2 min). Falls back to HF generate if
+        vLLM is unavailable or fails.
+        """
+        if self.trainer is None:
+            return
+
+        print(f"\n[Eval] Running checkpoint eval at step {step} on {len(self.eval_dataset)} problems...")
+        t0 = time.time()
 
         prompts = self.eval_dataset["prompt"]
         answers = self.eval_dataset["answer"]
 
-        with torch.no_grad():
-            for i in range(0, len(prompts), batch_size):
-                batch_prompts = prompts[i : i + batch_size]
-                batch_answers = answers[i : i + batch_size]
+        # Try vLLM first (fast), fall back to HF generate (slow)
+        use_vllm = hasattr(self.trainer, "vllm_generation") and self.trainer.vllm_generation is not None
+        if use_vllm:
+            try:
+                print("[Eval] Using vLLM for generation...")
+                all_correct, all_num_tokens = self._generate_vllm(prompts, answers)
+            except Exception as e:
+                print(f"[Eval] vLLM failed ({e}), falling back to HF generate...")
+                use_vllm = False
 
-                inputs = self.tokenizer(
-                    batch_prompts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                ).to(model.device)
-
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_completion_length,
-                    do_sample=False,
-                )
-
-                # Decode only the generated tokens (strip the prompt)
-                prompt_len = inputs["input_ids"].shape[1]
-                for j, output in enumerate(outputs):
-                    gen_ids = output[prompt_len:]
-                    completion = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-                    num_tokens = len(gen_ids)
-
-                    correct = check_correctness(completion, batch_answers[j])
-                    all_correct.append(correct)
-                    all_num_tokens.append(num_tokens)
-
-        if was_training:
-            model.train()
+        if not use_vllm:
+            print("[Eval] Using HF generate (slow fallback)...")
+            model = self.trainer.model
+            was_training = model.training
+            model.eval()
+            all_correct, all_num_tokens = self._generate_hf(model, prompts, answers)
+            if was_training:
+                model.train()
 
         # Compute stats
         accuracy = statistics.mean(all_correct)
@@ -270,6 +319,24 @@ class CheckpointEvalCallback(TrainerCallback):
             )
         except Exception:
             pass
+
+    def on_train_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        self._run_eval(step=0)
+
+    def on_save(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        self._run_eval(step=state.global_step)
 
     def close(self):
         try:

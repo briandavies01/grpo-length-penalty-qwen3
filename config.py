@@ -224,6 +224,8 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--seed", type=int, default=_d.seed)
     parser.add_argument("--wandb_project", type=str, default="grpo-length-penalty",
                         help="Weights & Biases project name")
+    parser.add_argument("--resume_from_checkpoint", type=str, default="",
+                        help="Path to checkpoint dir to resume training from")
 
     args = parser.parse_args()
 
@@ -256,7 +258,8 @@ def parse_args() -> ExperimentConfig:
         seed=args.seed,
     )
 
-    # Store wandb_project as an extra attribute for grpo_train.py to use
+    # Store extra attributes for grpo_train.py to use
     config.wandb_project = args.wandb_project
+    config.resume_from_checkpoint = args.resume_from_checkpoint or None
 
     return config

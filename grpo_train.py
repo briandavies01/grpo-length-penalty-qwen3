@@ -311,7 +311,9 @@ def main():
 
     # --- Train ---
     print(f"\nStarting GRPO training...")
-    trainer.train()
+    if config.resume_from_checkpoint:
+        print(f"  Resuming from checkpoint: {config.resume_from_checkpoint}")
+    trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
 
     # --- Save final adapter ---
     # With LoRA, save_model saves only the adapter weights (small, ~50MB)
