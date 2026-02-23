@@ -207,6 +207,7 @@ def main():
         logger=reward_logger,
         lambda_length=config.lambda_length,
         max_answer_tokens=config.max_answer_tokens,
+        length_penalty_on_correct_only=config.length_penalty_on_correct_only,
     )
 
     # --- Sample fixed eval set ---
@@ -232,7 +233,12 @@ def main():
     # --- Create GRPOTrainer ---
     print(f"Initializing GRPOTrainer...")
     print(f"  Lambda: {config.lambda_length}")
-    print(f"  Reward: correctness(+1/-1) - {config.lambda_length} * (tokens/max_tokens)")
+    if config.length_penalty_on_correct_only:
+        print(f"  Reward mode: correct-only length penalty")
+        print(f"    Correct: +1 - {config.lambda_length} * (tokens/max_tokens)")
+        print(f"    Wrong:   -1 (flat, no length component)")
+    else:
+        print(f"  Reward: correctness(+1/-1) - {config.lambda_length} * (tokens/max_tokens)")
     print(f"  Loss type: {config.loss_type}")
     print(f"  Num generations: {config.num_generations}")
     print(f"  Max completion length: {config.max_completion_length}")

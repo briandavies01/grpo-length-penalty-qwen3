@@ -360,10 +360,12 @@ class CombinedRewardFunction:
 
     __name__ = "combined_reward"
 
-    def __init__(self, logger: RewardLogger, lambda_length: float = 2.0, max_answer_tokens: int = 0):
+    def __init__(self, logger: RewardLogger, lambda_length: float = 2.0, max_answer_tokens: int = 0,
+                 length_penalty_on_correct_only: bool = False):
         self.logger = logger
         self.lambda_length = lambda_length
         self.max_answer_tokens = max_answer_tokens
+        self.length_penalty_on_correct_only = length_penalty_on_correct_only
 
     def __call__(self, prompts, completions, completion_ids, **kwargs):
         solutions = kwargs.get("solution", [""] * len(completions))
@@ -395,7 +397,10 @@ class CombinedRewardFunction:
             length_ratio = num_tokens / max_len
 
             # Combined reward
-            reward = correctness_score - self.lambda_length * length_ratio
+            if self.length_penalty_on_correct_only and correct != 1.0:
+                reward = -1.0  # Flat penalty for wrong answers, no length component
+            else:
+                reward = correctness_score - self.lambda_length * length_ratio
 
             all_rewards.append(reward)
             all_correctness_binary.append(correct)

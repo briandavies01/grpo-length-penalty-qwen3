@@ -24,6 +24,7 @@ class ExperimentConfig:
 
     # Length penalty
     lambda_length: float = 2.0
+    length_penalty_on_correct_only: bool = False  # If True, wrong answers get flat -1 (no length component)
 
     # Training
     max_steps: int = 150
@@ -218,6 +219,8 @@ def parse_args() -> ExperimentConfig:
                         help="Save checkpoint every N steps")
     parser.add_argument("--save_total_limit", type=int, default=_d.save_total_limit,
                         help="Max number of checkpoints to keep")
+    parser.add_argument("--length_penalty_on_correct_only", action="store_true",
+                        help="Only apply length penalty to correct answers; wrong answers get flat -1")
     parser.add_argument("--no_vllm", action="store_true", help="Disable vLLM, use HF generate")
     parser.add_argument("--output_dir", type=str, default=_d.output_dir)
     parser.add_argument("--run_name", type=str, default=_d.run_name)
@@ -250,6 +253,7 @@ def parse_args() -> ExperimentConfig:
         lora_alpha=args.lora_alpha,
         min_solved_pct=args.min_solved_pct,
         max_solved_pct=args.max_solved_pct,
+        length_penalty_on_correct_only=args.length_penalty_on_correct_only,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         use_vllm=not args.no_vllm,
