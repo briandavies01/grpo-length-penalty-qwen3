@@ -1,15 +1,14 @@
-"""Reward functions for GRPO training with GDPO-style normalize_then_sum.
+"""Reward function for GRPO training with combined correctness + length penalty.
 
-Two separate reward functions (correctness + length penalty) that TRL normalizes
-independently per group, then combines with reward_weights=[1.0, lambda_length].
+Single reward function: reward = correctness - lambda * (tokens / max_tokens)
+where correctness = +1 if correct, -1 if incorrect.
 
-This prevents group normalization from canceling out lambda (the root cause of
-lambda 0.1-2.0 producing identical training dynamics in the entangled setup).
+TRL normalizes this combined reward within each group (scale_rewards="group"),
+giving standard GRPO advantage estimation on the total signal.
 
 Architecture:
-- RewardLogger: shared state + file handles, called by both reward functions
-- CorrectnessRewardFunction: returns 0/1 correctness, buffers data on logger
-- LengthPenaltyRewardFunction: returns length penalty, triggers full log flush
+- RewardLogger: logging state + file handles
+- CombinedRewardFunction: computes combined reward, triggers log flush
 """
 
 import json
@@ -121,24 +120,10 @@ def check_correctness(
         return 0.0
 
 
-def compute_length_penalty(num_tokens: int, max_completion_length: int) -> float:
-    """Compute length penalty: -(num_tokens / max_completion_length).
-
-    Always negative or zero. A completion using half the max length gets -0.5.
-    """
-    return -(num_tokens / max_completion_length)
-
-
 class RewardLogger:
-    """Shared logging state between the two reward functions.
+    """Logging state for the combined reward function.
 
-    Holds file handles, timing attributes (set by StepSyncCallback), and a
-    buffer so CorrectnessRewardFunction can pass data to LengthPenaltyRewardFunction
-    for the combined log flush.
-
-    Also computes a synthetic "total_reward" (correctness + lambda * lp) for log
-    compatibility with analysis scripts. This is NOT used by TRL for training —
-    TRL uses normalize_then_sum with reward_weights instead.
+    Holds file handles and timing attributes (set by StepSyncCallback).
     """
 
     def __init__(
@@ -150,7 +135,7 @@ class RewardLogger:
     ):
         self.num_generations = num_generations
         self.max_completion_length = max_completion_length
-        self.lambda_length = lambda_length  # For logging only
+        self.lambda_length = lambda_length
 
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -159,39 +144,24 @@ class RewardLogger:
         self._prompt_fh = open(self.log_dir / "prompt_stats.jsonl", "a", encoding="utf-8")
         self._step_fh = open(self.log_dir / "step_stats.jsonl", "a", encoding="utf-8")
 
-        # Buffer: set by CorrectnessRewardFunction, consumed by LengthPenaltyRewardFunction
-        self._correctness_buffer = None
-
-    def buffer_correctness_data(self, data: dict):
-        """Store correctness data for the length penalty function to use."""
-        self._correctness_buffer = data
-
-    def flush_logs(self, length_penalties: list[float], num_tokens_list: list[int]):
-        """Write all three log files using buffered correctness + fresh length data.
-
-        Called by LengthPenaltyRewardFunction after computing length penalties.
-        """
-        buf = self._correctness_buffer
-        self._correctness_buffer = None
-
-        step = buf["step"]
-        timestamp = buf["timestamp"]
-        prompts = buf["prompts"]
-        completions = buf["completions"]
-        solutions = buf["solutions"]
-        all_correctness = buf["all_correctness"]
-        all_has_think = buf["all_has_think"]
-        all_has_boxed = buf["all_has_boxed"]
-
+    def flush_logs(
+        self,
+        step: int,
+        timestamp: str,
+        prompts: list[str],
+        completions: list[str],
+        solutions: list[str],
+        all_correctness_binary: list[float],
+        all_rewards: list[float],
+        length_ratios: list[float],
+        num_tokens_list: list[int],
+        all_has_think: list[bool],
+        all_has_boxed: list[bool],
+    ):
+        """Write all three log files with combined reward data."""
         G = self.num_generations
         num_completions = len(completions)
         num_prompts = num_completions // G
-
-        # Compute synthetic total_reward for log compatibility
-        all_rewards = [
-            c + self.lambda_length * lp
-            for c, lp in zip(all_correctness, length_penalties)
-        ]
 
         # --- Per-rollout logging ---
         for i in range(num_completions):
@@ -205,8 +175,8 @@ class RewardLogger:
                 "prompt_text": prompts[i][:300] if i < len(prompts) else "",
                 "completion_text": completions[i],
                 "ground_truth": solutions[i],
-                "correctness_reward": all_correctness[i],
-                "length_penalty": length_penalties[i],
+                "correctness_binary": all_correctness_binary[i],
+                "length_ratio": length_ratios[i],
                 "total_reward": all_rewards[i],
                 "num_tokens": num_tokens_list[i],
                 "has_think_tags": all_has_think[i],
@@ -223,8 +193,8 @@ class RewardLogger:
             end = start + G
 
             group_rewards = all_rewards[start:end]
-            group_correctness = all_correctness[start:end]
-            group_length_pens = length_penalties[start:end]
+            group_correctness = all_correctness_binary[start:end]
+            group_length_ratios = length_ratios[start:end]
             group_tokens = num_tokens_list[start:end]
             group_think = all_has_think[start:end]
             group_boxed = all_has_boxed[start:end]
@@ -247,7 +217,7 @@ class RewardLogger:
                 "reward_mean": mean_r,
                 "reward_std": std_r,
                 "correctness_mean": statistics.mean(group_correctness),
-                "length_penalty_mean": statistics.mean(group_length_pens),
+                "length_ratio_mean": statistics.mean(group_length_ratios),
                 "length_mean": statistics.mean(group_tokens),
                 "length_std": statistics.pstdev(group_tokens),
                 "length_min": min(group_tokens),
@@ -262,12 +232,15 @@ class RewardLogger:
         self._prompt_fh.flush()
 
         # --- Per-step aggregation ---
-        accuracy = statistics.mean(all_correctness)
+        accuracy = statistics.mean(all_correctness_binary)
         mean_tokens = statistics.mean(num_tokens_list)
         sorted_tokens = sorted(num_tokens_list)
         median_tokens = sorted_tokens[len(sorted_tokens) // 2]
 
         per_prompt_stds = []
+        per_prompt_correctness_stds = []
+        per_prompt_length_stds = []
+        per_prompt_length_var_shares = []
         frac_all_correct = 0
         frac_all_incorrect = 0
         for p in range(num_prompts):
@@ -275,11 +248,26 @@ class RewardLogger:
             end = start + G
             group_r = all_rewards[start:end]
             per_prompt_stds.append(statistics.pstdev(group_r))
-            group_c = all_correctness[start:end]
+            group_c = all_correctness_binary[start:end]
             if all(c == 1.0 for c in group_c):
                 frac_all_correct += 1
             if all(c == 0.0 for c in group_c):
                 frac_all_incorrect += 1
+
+            # Variance decomposition: correctness component vs length component
+            group_correctness_scores = [1.0 if c == 1.0 else -1.0 for c in group_c]
+            group_length_terms = [self.lambda_length * lr for lr in length_ratios[start:end]]
+            std_c = statistics.pstdev(group_correctness_scores)
+            std_l = statistics.pstdev(group_length_terms)
+            per_prompt_correctness_stds.append(std_c)
+            per_prompt_length_stds.append(std_l)
+
+            # Length variance share: var(length) / var(total), guarded against zero
+            var_total = statistics.pvariance(group_r)
+            if var_total > 1e-12:
+                per_prompt_length_var_shares.append(statistics.pvariance(group_length_terms) / var_total)
+            else:
+                per_prompt_length_var_shares.append(0.5)  # No signal either way
 
         total_tokens = sum(num_tokens_list)
 
@@ -288,8 +276,7 @@ class RewardLogger:
             "num_prompts": num_prompts,
             "num_rollouts": num_completions,
             "accuracy": accuracy,
-            "mean_correctness_reward": statistics.mean(all_correctness),
-            "mean_length_penalty": statistics.mean(length_penalties),
+            "mean_length_ratio": statistics.mean(length_ratios),
             "mean_total_reward": statistics.mean(all_rewards),
             "std_total_reward": statistics.pstdev(all_rewards),
             "total_tokens": total_tokens,
@@ -333,22 +320,25 @@ class RewardLogger:
                 "custom/accuracy": accuracy,
                 "custom/mean_completion_length": mean_tokens,
                 "custom/median_completion_length": median_tokens,
+                "custom/max_completion_length": max(num_tokens_list),
                 "custom/total_tokens": total_tokens,
-                "custom/mean_correctness_reward": step_record["mean_correctness_reward"],
-                "custom/mean_length_penalty": step_record["mean_length_penalty"],
+                "custom/mean_length_ratio": step_record["mean_length_ratio"],
                 "custom/mean_total_reward": step_record["mean_total_reward"],
                 "custom/frac_has_think": step_record["frac_has_think"],
                 "custom/frac_has_boxed": step_record["frac_has_boxed"],
                 "custom/mean_reward_std_per_prompt": step_record["mean_reward_std_per_prompt"],
                 "custom/frac_prompts_all_correct": step_record["frac_prompts_all_correct"],
                 "custom/frac_prompts_all_incorrect": step_record["frac_prompts_all_incorrect"],
+                "signal/mean_group_std_correctness": statistics.mean(per_prompt_correctness_stds),
+                "signal/mean_group_std_length": statistics.mean(per_prompt_length_stds),
+                "signal/length_variance_share": statistics.mean(per_prompt_length_var_shares),
             }
             if step_record.get("step_time_sec") is not None:
                 wb_data["perf/step_time_sec"] = step_record["step_time_sec"]
                 wb_data["perf/gpu_allocated_gb"] = step_record["gpu_allocated_gb"]
                 wb_data["perf/gpu_reserved_gb"] = step_record["gpu_reserved_gb"]
                 wb_data["perf/gpu_peak_gb"] = step_record["gpu_peak_gb"]
-            wandb.log(wb_data)
+            wandb.log(wb_data, commit=False)
         except Exception:
             pass
 
@@ -361,17 +351,18 @@ class RewardLogger:
                 pass
 
 
-class CorrectnessRewardFunction:
-    """Returns binary correctness reward (0 or 1) for each completion.
+class CombinedRewardFunction:
+    """Returns combined reward: correctness_score - lambda * (tokens / max_tokens).
 
-    Buffers per-rollout metadata on the shared RewardLogger so the
-    LengthPenaltyRewardFunction can include it in the combined log flush.
+    correctness_score = +1 if correct, -1 if incorrect.
+    TRL normalizes this single reward within each group (scale_rewards="group").
     """
 
-    __name__ = "correctness"
+    __name__ = "combined_reward"
 
-    def __init__(self, logger: RewardLogger, max_answer_tokens: int = 0):
+    def __init__(self, logger: RewardLogger, lambda_length: float = 2.0, max_answer_tokens: int = 0):
         self.logger = logger
+        self.lambda_length = lambda_length
         self.max_answer_tokens = max_answer_tokens
 
     def __call__(self, prompts, completions, completion_ids, **kwargs):
@@ -380,7 +371,12 @@ class CorrectnessRewardFunction:
         step = trainer_state.global_step if trainer_state else 0
         timestamp = datetime.now().isoformat()
 
-        all_correctness = []
+        max_len = self.logger.max_completion_length
+
+        all_rewards = []
+        all_correctness_binary = []
+        all_length_ratios = []
+        all_num_tokens = []
         all_has_think = []
         all_has_boxed = []
 
@@ -388,55 +384,42 @@ class CorrectnessRewardFunction:
             comp_text = completions[i]
             sol = solutions[i]
 
-            correctness = check_correctness(comp_text, sol, self.max_answer_tokens)
+            # Binary correctness (0/1) for accuracy logging
+            correct = check_correctness(comp_text, sol, self.max_answer_tokens)
+
+            # Correctness score: +1 or -1
+            correctness_score = 1.0 if correct == 1.0 else -1.0
+
+            # Length ratio (0 to 1)
+            num_tokens = len(completion_ids[i])
+            length_ratio = num_tokens / max_len
+
+            # Combined reward
+            reward = correctness_score - self.lambda_length * length_ratio
+
+            all_rewards.append(reward)
+            all_correctness_binary.append(correct)
+            all_length_ratios.append(length_ratio)
+            all_num_tokens.append(num_tokens)
+
             has_think = "<think>" in comp_text and "</think>" in comp_text
             has_boxed = "\\boxed" in comp_text
-
-            all_correctness.append(correctness)
             all_has_think.append(has_think)
             all_has_boxed.append(has_boxed)
 
-        # Buffer data for the length penalty function to use during log flush
-        self.logger.buffer_correctness_data({
-            "step": step,
-            "timestamp": timestamp,
-            "prompts": prompts,
-            "completions": completions,
-            "solutions": solutions,
-            "all_correctness": all_correctness,
-            "all_has_think": all_has_think,
-            "all_has_boxed": all_has_boxed,
-        })
+        # Flush all logs
+        self.logger.flush_logs(
+            step=step,
+            timestamp=timestamp,
+            prompts=prompts,
+            completions=completions,
+            solutions=solutions,
+            all_correctness_binary=all_correctness_binary,
+            all_rewards=all_rewards,
+            length_ratios=all_length_ratios,
+            num_tokens_list=all_num_tokens,
+            all_has_think=all_has_think,
+            all_has_boxed=all_has_boxed,
+        )
 
-        return all_correctness
-
-
-class LengthPenaltyRewardFunction:
-    """Returns raw length penalty for each completion (no lambda scaling).
-
-    Lambda scaling is handled by TRL's reward_weights parameter.
-    After computing length penalties, triggers the full log flush on the
-    shared RewardLogger.
-    """
-
-    __name__ = "length_penalty"
-
-    def __init__(self, logger: RewardLogger):
-        self.logger = logger
-
-    def __call__(self, prompts, completions, completion_ids, **kwargs):
-        max_len = self.logger.max_completion_length
-
-        all_length_penalties = []
-        all_num_tokens = []
-
-        for i in range(len(completions)):
-            num_tokens = len(completion_ids[i])
-            lp = compute_length_penalty(num_tokens, max_len)
-            all_length_penalties.append(lp)
-            all_num_tokens.append(num_tokens)
-
-        # Trigger combined log flush
-        self.logger.flush_logs(all_length_penalties, all_num_tokens)
-
-        return all_length_penalties
+        return all_rewards

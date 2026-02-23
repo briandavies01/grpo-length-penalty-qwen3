@@ -1,10 +1,8 @@
-"""Main entry point for GRPO training of Qwen3 with GDPO-style length penalty and LoRA.
+"""Main entry point for GRPO training of Qwen3 with combined length penalty and LoRA.
 
-Uses normalize_then_sum multi-objective aggregation: correctness and length
-penalty are separate reward functions, each z-scored independently within
-groups, then combined with reward_weights=[1.0, lambda_length]. This prevents
-group normalization from canceling out lambda (the root cause of lambda 0.1-2.0
-producing identical training dynamics in the entangled single-reward setup).
+Single combined reward: correctness_score - lambda * (tokens / max_tokens),
+where correctness_score = +1 (correct) / -1 (incorrect). TRL normalizes
+this combined reward within each group (scale_rewards="group").
 
 Uses LoRA (Low-Rank Adaptation) to fit training on a single GPU.
 
@@ -57,9 +55,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOTrainer
 
 from config import ExperimentConfig, parse_args
-from data import load_and_format_dataset, verify_prompt_tokenization
-from logging_utils import StepSyncCallback
-from rewards import RewardLogger, CorrectnessRewardFunction, LengthPenaltyRewardFunction
+from data import load_and_format_dataset, sample_baseline_problems, verify_prompt_tokenization
+from logging_utils import StepSyncCallback, CheckpointEvalCallback
+from rewards import RewardLogger, CombinedRewardFunction
 
 
 def merge_checkpoint_into_base(model_name: str, checkpoint_path: str, save_dir: str) -> str:
@@ -134,6 +132,7 @@ def main():
     # --- Initialize W&B ---
     wandb.init(
         project=getattr(config, "wandb_project", "grpo-length-penalty"),
+        entity="lucferon04-optiver",
         name=run_name,
         config=config_dict,
     )
@@ -197,28 +196,44 @@ def main():
     grpo_config.run_name = run_name
     grpo_config.output_dir = run_dir
 
-    # --- Create reward functions (GDPO: two separate signals) ---
+    # --- Create reward function (single combined reward) ---
     reward_logger = RewardLogger(
         num_generations=config.num_generations,
         max_completion_length=config.max_completion_length,
-        lambda_length=config.lambda_length,  # For logging only; TRL uses reward_weights
+        lambda_length=config.lambda_length,
         log_dir=log_dir,
     )
-    correctness_fn = CorrectnessRewardFunction(
+    reward_fn = CombinedRewardFunction(
         logger=reward_logger,
+        lambda_length=config.lambda_length,
         max_answer_tokens=config.max_answer_tokens,
     )
-    length_fn = LengthPenaltyRewardFunction(logger=reward_logger)
 
-    # --- Create callback for cleanup ---
+    # --- Sample fixed eval set ---
+    print(f"Sampling eval problems...")
+    eval_dataset = sample_baseline_problems(
+        dataset_name=config.dataset_name,
+        num_problems=100,
+        seed=42,
+        min_solved_pct=config.min_solved_pct,
+        max_solved_pct=config.max_solved_pct,
+    )
+    print(f"Eval dataset: {len(eval_dataset)} problems")
+
+    # --- Create callbacks ---
     step_sync_callback = StepSyncCallback(reward_logger)
+    eval_callback = CheckpointEvalCallback(
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        max_completion_length=config.max_completion_length,
+        log_dir=log_dir,
+    )
 
     # --- Create GRPOTrainer ---
     print(f"Initializing GRPOTrainer...")
     print(f"  Lambda: {config.lambda_length}")
+    print(f"  Reward: correctness(+1/-1) - {config.lambda_length} * (tokens/max_tokens)")
     print(f"  Loss type: {config.loss_type}")
-    print(f"  Multi-objective: {grpo_config.multi_objective_aggregation}")
-    print(f"  Reward weights: {grpo_config.reward_weights}")
     print(f"  Num generations: {config.num_generations}")
     print(f"  Max completion length: {config.max_completion_length}")
     print(f"  Max answer tokens: {config.max_answer_tokens} {'(unlimited)' if config.max_answer_tokens == 0 else ''}")
@@ -237,12 +252,12 @@ def main():
         # model_path is either the HF model name or path to merged checkpoint
         trainer = GRPOTrainer(
             model=model_path,
-            reward_funcs=[correctness_fn, length_fn],
+            reward_funcs=[reward_fn],
             args=grpo_config,
             train_dataset=train_dataset,
             processing_class=tokenizer,
             peft_config=lora_config,
-            callbacks=[step_sync_callback],
+            callbacks=[step_sync_callback, eval_callback],
         )
     else:
         # HF generate fallback: load model ourselves, let TRL wrap with LoRA
@@ -261,13 +276,16 @@ def main():
             )
         trainer = GRPOTrainer(
             model=model,
-            reward_funcs=[correctness_fn, length_fn],
+            reward_funcs=[reward_fn],
             args=grpo_config,
             train_dataset=train_dataset,
             processing_class=tokenizer,
             peft_config=lora_config,
-            callbacks=[step_sync_callback],
+            callbacks=[step_sync_callback, eval_callback],
         )
+
+    # --- Wire eval callback to trainer ---
+    eval_callback.trainer = trainer
 
     # --- Load explicit reference model for KL penalty ---
     if config.beta > 0 and config.ref_model_name:
@@ -308,6 +326,7 @@ def main():
 
     # --- Cleanup ---
     reward_logger.close()
+    eval_callback.close()
     wandb.finish()
     print("Done.")
 

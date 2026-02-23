@@ -17,7 +17,9 @@ IM_START = "<|im_start|>"  # ID 151644
 IM_END = "<|im_end|>"      # ID 151645
 
 INSTRUCTION_SUFFIX = (
-    "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+    "\n\nPlease reason through this problem for yourself, and then when giving "
+    "your answer ONLY provide your final answer within \\boxed{} and DO NOT "
+    "provide any reasoning."
 )
 
 

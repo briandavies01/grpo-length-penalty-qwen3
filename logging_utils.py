@@ -1,13 +1,17 @@
-"""Logging utilities: JSONL helpers, advantage computation, trainer callback."""
+"""Logging utilities: JSONL helpers, advantage computation, trainer callbacks."""
 
 import json
 import statistics
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
+import wandb
 from transformers import TrainerCallback, TrainerControl, TrainerState
 from transformers import TrainingArguments
+
+from rewards import check_correctness
 
 
 def write_jsonl_line(fh, record: dict) -> None:
@@ -151,3 +155,124 @@ class StepSyncCallback(TrainerCallback):
 
         self.reward_logger.close()
         print(f"Log files closed.")
+
+
+class CheckpointEvalCallback(TrainerCallback):
+    """Runs lightweight eval on a fixed problem set every checkpoint save.
+
+    Uses HF generate (not vLLM) with greedy decoding in batches of 4.
+    Logs accuracy and token length stats to W&B and JSONL.
+    """
+
+    def __init__(self, eval_dataset, tokenizer, max_completion_length: int, log_dir: str):
+        self.eval_dataset = eval_dataset
+        self.tokenizer = tokenizer
+        self.max_completion_length = max_completion_length
+        self.log_dir = Path(log_dir)
+        self.trainer = None  # Set after trainer creation
+        self._eval_fh = open(self.log_dir / "eval_stats.jsonl", "a", encoding="utf-8")
+
+    def on_save(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        if self.trainer is None:
+            return
+
+        step = state.global_step
+        print(f"\n[Eval] Running checkpoint eval at step {step} on {len(self.eval_dataset)} problems...")
+        t0 = time.time()
+
+        model = self.trainer.model
+        was_training = model.training
+        model.eval()
+
+        all_correct = []
+        all_num_tokens = []
+        batch_size = 4
+
+        prompts = self.eval_dataset["prompt"]
+        answers = self.eval_dataset["answer"]
+
+        with torch.no_grad():
+            for i in range(0, len(prompts), batch_size):
+                batch_prompts = prompts[i : i + batch_size]
+                batch_answers = answers[i : i + batch_size]
+
+                inputs = self.tokenizer(
+                    batch_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                ).to(model.device)
+
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_completion_length,
+                    do_sample=False,
+                )
+
+                # Decode only the generated tokens (strip the prompt)
+                prompt_len = inputs["input_ids"].shape[1]
+                for j, output in enumerate(outputs):
+                    gen_ids = output[prompt_len:]
+                    completion = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    num_tokens = len(gen_ids)
+
+                    correct = check_correctness(completion, batch_answers[j])
+                    all_correct.append(correct)
+                    all_num_tokens.append(num_tokens)
+
+        if was_training:
+            model.train()
+
+        # Compute stats
+        accuracy = statistics.mean(all_correct)
+        mean_tokens = statistics.mean(all_num_tokens)
+        sorted_tokens = sorted(all_num_tokens)
+        median_tokens = sorted_tokens[len(sorted_tokens) // 2]
+        elapsed = time.time() - t0
+
+        # Console
+        print(
+            f"[Eval] Step {step}: acc={accuracy:.3f} "
+            f"mean_tok={mean_tokens:.0f} med_tok={median_tokens} "
+            f"({elapsed:.1f}s)"
+        )
+
+        # JSONL
+        record = {
+            "step": step,
+            "accuracy": accuracy,
+            "mean_tokens": mean_tokens,
+            "median_tokens": median_tokens,
+            "min_tokens": min(all_num_tokens),
+            "max_tokens": max(all_num_tokens),
+            "num_problems": len(all_correct),
+            "elapsed_sec": elapsed,
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._eval_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._eval_fh.flush()
+
+        # W&B
+        try:
+            wandb.log(
+                {
+                    "eval/accuracy": accuracy,
+                    "eval/mean_tokens": mean_tokens,
+                    "eval/median_tokens": median_tokens,
+                },
+                commit=False,
+            )
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._eval_fh.close()
+        except Exception:
+            pass

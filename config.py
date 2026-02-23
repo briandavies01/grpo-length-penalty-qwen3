@@ -14,7 +14,7 @@ class ExperimentConfig:
     """All experiment-level hyperparameters."""
 
     # Model
-    model_name: str = "Qwen/Qwen3-1.7B"
+    model_name: str = "Qwen/Qwen3-4B"
     init_checkpoint: str = ""  # Optional: LoRA checkpoint to merge into base before training
     ref_model_name: str = ""  # Optional: explicit reference model for KL (overrides PEFT adapter-disable)
     skip_first_n_prompts: int = 0  # Skip prompts seen in prior training (from same seed)
@@ -23,13 +23,13 @@ class ExperimentConfig:
     dataset_name: str = "lime-nlp/deepscaleR_difficulty"
 
     # Length penalty
-    lambda_length: float = 0.0
+    lambda_length: float = 2.0
 
     # Training
     max_steps: int = 150
     per_device_train_batch_size: int = 0  # 0 = auto-set to num_generations
     gradient_accumulation_steps: int = 1
-    learning_rate: float = 5e-6  # 10x higher than full fine-tuning (standard for LoRA)
+    learning_rate: float = 5e-5  # 10x higher than full fine-tuning (standard for LoRA)
     warmup_ratio: float = 0.05
     lr_scheduler_type: str = "constant_with_warmup"
     max_grad_norm: float = 1.0
@@ -38,10 +38,10 @@ class ExperimentConfig:
 
     # GRPO-specific
     num_generations: int = 8
-    max_completion_length: int = 8192
+    max_completion_length: int = 14336
     max_prompt_length: int = 1024
     max_answer_tokens: int = 0  # 0 = no limit; >0 = only check correctness within N tokens after </think>
-    temperature: float = 0.6
+    temperature: float = 0.8
     top_p: float = 0.95
     loss_type: str = "dr_grpo"
     beta: float = 0.0
@@ -52,7 +52,7 @@ class ExperimentConfig:
     # LoRA
     lora_rank: int = 16
     lora_alpha: int = 32
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0
     lora_target_modules: list = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",  # All attention projections
         "gate_proj", "up_proj", "down_proj",       # All MLP layers
@@ -144,10 +144,6 @@ class ExperimentConfig:
             num_iterations=self.num_iterations,
             epsilon=self.epsilon,
             scale_rewards=self.scale_rewards,
-            # GDPO: normalize each reward signal independently, then combine
-            # This prevents group normalization from canceling out lambda
-            multi_objective_aggregation="normalize_then_sum",
-            reward_weights=[1.0, self.lambda_length],
             # vLLM
             use_vllm=self.use_vllm,
             vllm_mode=self.vllm_mode,
@@ -174,60 +170,60 @@ class ExperimentConfig:
 
 
 def parse_args() -> ExperimentConfig:
-    """Parse command-line arguments into an ExperimentConfig."""
+    """Parse command-line arguments into an ExperimentConfig.
+
+    All defaults come from ExperimentConfig — single source of truth.
+    """
+    _d = ExperimentConfig()  # Defaults
+
     parser = argparse.ArgumentParser(
         description="GRPO training with length penalty for CoT monitorability"
     )
 
-    parser.add_argument("--model_name", type=str,
-                        default="Qwen/Qwen3-1.7B",
+    parser.add_argument("--model_name", type=str, default=_d.model_name,
                         help="Base model name or path")
-    parser.add_argument(
-        "--lambda_length", type=float, required=True,
-        help="Length penalty coefficient (e.g., 0.0, 0.1, 0.3, 1.0, 3.0)"
-    )
-    parser.add_argument("--max_steps", type=int, default=150)
-    parser.add_argument("--num_generations", type=int, default=8)
-    parser.add_argument("--max_completion_length", type=int, default=8192)
-    parser.add_argument("--max_answer_tokens", type=int, default=0,
-                        help="Max tokens after </think> for correctness check (0=unlimited, 150 recommended)")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=0,
+    parser.add_argument("--lambda_length", type=float, default=_d.lambda_length,
+                        help="Length penalty coefficient in reward = correctness - lambda * (tokens/max_tokens)")
+    parser.add_argument("--max_steps", type=int, default=_d.max_steps)
+    parser.add_argument("--num_generations", type=int, default=_d.num_generations)
+    parser.add_argument("--max_completion_length", type=int, default=_d.max_completion_length)
+    parser.add_argument("--max_answer_tokens", type=int, default=_d.max_answer_tokens,
+                        help="Max tokens after </think> for correctness check (0=unlimited)")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=_d.per_device_train_batch_size,
                         help="0 = auto-set to num_generations (recommended)")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
-    parser.add_argument("--loss_type", type=str, default="dr_grpo")
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--min_solved_pct", type=float, default=50.0,
-                        help="Min solved_percentage for difficulty filter (default 50)")
-    parser.add_argument("--max_solved_pct", type=float, default=95.0,
-                        help="Max solved_percentage for difficulty filter (default 95)")
-    parser.add_argument("--skip_first_n_prompts", type=int, default=0,
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=_d.gradient_accumulation_steps)
+    parser.add_argument("--learning_rate", type=float, default=_d.learning_rate)
+    parser.add_argument("--loss_type", type=str, default=_d.loss_type)
+    parser.add_argument("--temperature", type=float, default=_d.temperature)
+    parser.add_argument("--top_p", type=float, default=_d.top_p)
+    parser.add_argument("--lora_rank", type=int, default=_d.lora_rank)
+    parser.add_argument("--lora_alpha", type=int, default=_d.lora_alpha)
+    parser.add_argument("--min_solved_pct", type=float, default=_d.min_solved_pct,
+                        help="Min solved_percentage for difficulty filter")
+    parser.add_argument("--max_solved_pct", type=float, default=_d.max_solved_pct,
+                        help="Max solved_percentage for difficulty filter")
+    parser.add_argument("--skip_first_n_prompts", type=int, default=_d.skip_first_n_prompts,
                         help="Skip the first N unique prompts from the dataset (matching "
                              "the order the prior run would have seen them with the same seed). "
                              "Use to avoid re-training on prompts from a prior run.")
-    parser.add_argument("--init_checkpoint", type=str, default="",
+    parser.add_argument("--init_checkpoint", type=str, default=_d.init_checkpoint,
                         help="Path to LoRA checkpoint to merge into base model before training. "
                              "Creates a fresh LoRA adapter on top of the merged model.")
-    parser.add_argument("--beta", type=float, default=0.0,
+    parser.add_argument("--beta", type=float, default=_d.beta,
                         help="KL penalty coefficient (0=disabled)")
-    parser.add_argument("--ref_model_name", type=str, default="",
+    parser.add_argument("--ref_model_name", type=str, default=_d.ref_model_name,
                         help="Explicit reference model for KL (e.g. original base model). "
                              "If empty, TRL uses adapter-disable for PEFT models.")
-    parser.add_argument("--save_steps", type=int, default=50,
+    parser.add_argument("--save_steps", type=int, default=_d.save_steps,
                         help="Save checkpoint every N steps")
-    parser.add_argument("--save_total_limit", type=int, default=3,
+    parser.add_argument("--save_total_limit", type=int, default=_d.save_total_limit,
                         help="Max number of checkpoints to keep")
     parser.add_argument("--no_vllm", action="store_true", help="Disable vLLM, use HF generate")
-    parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument("--run_name", type=str, default="")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--wandb_project", type=str, default="grpo-length-penalty",
-        help="Weights & Biases project name"
-    )
+    parser.add_argument("--output_dir", type=str, default=_d.output_dir)
+    parser.add_argument("--run_name", type=str, default=_d.run_name)
+    parser.add_argument("--seed", type=int, default=_d.seed)
+    parser.add_argument("--wandb_project", type=str, default="grpo-length-penalty",
+                        help="Weights & Biases project name")
 
     args = parser.parse_args()
 
