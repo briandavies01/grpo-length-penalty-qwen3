@@ -51,12 +51,14 @@ class StepSyncCallback(TrainerCallback):
     Also handles cleanup (closing file handles) on training end.
     """
 
-    def __init__(self, reward_logger):
+    def __init__(self, reward_logger, beta: float = 0.0):
         """
         Args:
             reward_logger: The RewardLogger instance (shared by both reward functions).
+            beta: KL penalty coefficient, used to compute KL loss contribution metrics.
         """
         self.reward_logger = reward_logger
+        self.beta = beta
         self._step_start_time = None
         self._train_start_time = None
         self._step_times = []
@@ -131,6 +133,34 @@ class StepSyncCallback(TrainerCallback):
         self.reward_logger._gpu_peak_gb = gpu_peak
         self.reward_logger._elapsed_sec = elapsed
         self.reward_logger._eta_sec = eta_sec
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs=None,
+        **kwargs,
+    ):
+        """Log KL contribution metrics when beta > 0."""
+        if logs is None or self.beta <= 0:
+            return
+
+        kl = logs.get("kl")
+        loss = logs.get("loss")
+        if kl is not None and loss is not None:
+            kl_contribution = self.beta * kl
+            kl_fraction = kl_contribution / abs(loss) if abs(loss) > 1e-10 else 0.0
+            try:
+                wandb.log(
+                    {
+                        "kl/loss_contribution": kl_contribution,
+                        "kl/loss_fraction": kl_fraction,
+                    },
+                    commit=False,
+                )
+            except Exception:
+                pass
 
     def on_train_end(
         self,
