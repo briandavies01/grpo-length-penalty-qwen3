@@ -243,6 +243,7 @@ class RewardLogger:
         per_prompt_length_var_shares = []
         frac_all_correct = 0
         frac_all_incorrect = 0
+        prompts_with_max_length = 0
         for p in range(num_prompts):
             start = p * G
             end = start + G
@@ -253,6 +254,9 @@ class RewardLogger:
                 frac_all_correct += 1
             if all(c == 0.0 for c in group_c):
                 frac_all_incorrect += 1
+            group_tokens = num_tokens_list[start:end]
+            if any(t >= self.max_completion_length for t in group_tokens):
+                prompts_with_max_length += 1
 
             # Variance decomposition: correctness component vs length component
             group_correctness_scores = [1.0 if c == 1.0 else -1.0 for c in group_c]
@@ -289,6 +293,7 @@ class RewardLogger:
             "mean_reward_std_per_prompt": statistics.mean(per_prompt_stds) if per_prompt_stds else 0.0,
             "frac_prompts_all_correct": frac_all_correct / num_prompts if num_prompts > 0 else 0.0,
             "frac_prompts_all_incorrect": frac_all_incorrect / num_prompts if num_prompts > 0 else 0.0,
+            "frac_prompts_hit_max_length": prompts_with_max_length / num_prompts if num_prompts > 0 else 0.0,
             "step_time_sec": getattr(self, "_last_step_time", None),
             "avg_step_time_sec": getattr(self, "_avg_step_time", None),
             "gpu_allocated_gb": getattr(self, "_gpu_allocated_gb", None),
@@ -329,6 +334,7 @@ class RewardLogger:
                 "custom/mean_reward_std_per_prompt": step_record["mean_reward_std_per_prompt"],
                 "custom/frac_prompts_all_correct": step_record["frac_prompts_all_correct"],
                 "custom/frac_prompts_all_incorrect": step_record["frac_prompts_all_incorrect"],
+                "custom/frac_prompts_hit_max_length": step_record["frac_prompts_hit_max_length"],
                 "signal/mean_group_std_correctness": statistics.mean(per_prompt_correctness_stds),
                 "signal/mean_group_std_length": statistics.mean(per_prompt_length_stds),
                 "signal/length_variance_share": statistics.mean(per_prompt_length_var_shares),
