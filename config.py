@@ -85,6 +85,10 @@ class ExperimentConfig:
     min_solved_pct: float = 50.0
     max_solved_pct: float = 95.0
 
+    # Resampling truncated completions
+    resample_truncated: bool = False
+    max_resample_retries: int = 3
+
     # Baseline eval
     baseline_num_problems: int = 100
     baseline_generations_per_problem: int = 8
@@ -221,7 +225,14 @@ def parse_args() -> ExperimentConfig:
                         help="Max number of checkpoints to keep")
     parser.add_argument("--length_penalty_on_correct_only", action="store_true",
                         help="Only apply length penalty to correct answers; wrong answers get flat -1")
+    parser.add_argument("--resample_truncated", action="store_true",
+                        help="Resample completions that hit max_completion_length instead of training on them")
+    parser.add_argument("--max_resample_retries", type=int, default=_d.max_resample_retries,
+                        help="Max retries for resampling truncated completions")
     parser.add_argument("--no_vllm", action="store_true", help="Disable vLLM, use HF generate")
+    parser.add_argument("--vllm_mode", type=str, default=_d.vllm_mode,
+                        choices=["colocate", "server"],
+                        help="vLLM mode: colocate (in-process) or server (separate vLLM server)")
     parser.add_argument("--output_dir", type=str, default=_d.output_dir)
     parser.add_argument("--run_name", type=str, default=_d.run_name)
     parser.add_argument("--seed", type=int, default=_d.seed)
@@ -254,9 +265,12 @@ def parse_args() -> ExperimentConfig:
         min_solved_pct=args.min_solved_pct,
         max_solved_pct=args.max_solved_pct,
         length_penalty_on_correct_only=args.length_penalty_on_correct_only,
+        resample_truncated=args.resample_truncated,
+        max_resample_retries=args.max_resample_retries,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         use_vllm=not args.no_vllm,
+        vllm_mode=args.vllm_mode,
         output_dir=args.output_dir,
         run_name=args.run_name,
         seed=args.seed,

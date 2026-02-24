@@ -222,7 +222,7 @@ def main():
     print(f"Eval dataset: {len(eval_dataset)} problems")
 
     # --- Create callbacks ---
-    step_sync_callback = StepSyncCallback(reward_logger)
+    step_sync_callback = StepSyncCallback(reward_logger, beta=config.beta)
     eval_callback = CheckpointEvalCallback(
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
@@ -230,8 +230,17 @@ def main():
         log_dir=log_dir,
     )
 
-    # --- Create GRPOTrainer ---
-    print(f"Initializing GRPOTrainer...")
+    # --- Determine trainer class ---
+    trainer_kwargs = {}
+    if config.resample_truncated:
+        from resampling_trainer import ResamplingGRPOTrainer
+        TrainerClass = ResamplingGRPOTrainer
+        trainer_kwargs["max_resample_retries"] = config.max_resample_retries
+    else:
+        TrainerClass = GRPOTrainer
+
+    # --- Create trainer ---
+    print(f"Initializing {TrainerClass.__name__}...")
     print(f"  Lambda: {config.lambda_length}")
     if config.length_penalty_on_correct_only:
         print(f"  Reward mode: correct-only length penalty")
@@ -250,13 +259,15 @@ def main():
     print(f"  Difficulty filter: solved_pct in [{config.min_solved_pct}, {config.max_solved_pct}]")
     if config.init_checkpoint:
         print(f"  Init checkpoint: {config.init_checkpoint} (merged into base)")
+    if config.resample_truncated:
+        print(f"  Resample truncated: True (max retries: {config.max_resample_retries})")
     print(f"  vLLM: {config.use_vllm} (mode: {config.vllm_mode})")
     print(f"  Output dir: {run_dir}")
 
     if config.use_vllm:
         # vLLM colocate mode: pass model path as string, TRL loads internally
         # model_path is either the HF model name or path to merged checkpoint
-        trainer = GRPOTrainer(
+        trainer = TrainerClass(
             model=model_path,
             reward_funcs=[reward_fn],
             args=grpo_config,
@@ -264,6 +275,7 @@ def main():
             processing_class=tokenizer,
             peft_config=lora_config,
             callbacks=[step_sync_callback, eval_callback],
+            **trainer_kwargs,
         )
     else:
         # HF generate fallback: load model ourselves, let TRL wrap with LoRA
@@ -280,7 +292,7 @@ def main():
                 model_path,
                 torch_dtype=torch.bfloat16,
             )
-        trainer = GRPOTrainer(
+        trainer = TrainerClass(
             model=model,
             reward_funcs=[reward_fn],
             args=grpo_config,
@@ -288,6 +300,7 @@ def main():
             processing_class=tokenizer,
             peft_config=lora_config,
             callbacks=[step_sync_callback, eval_callback],
+            **trainer_kwargs,
         )
 
     # --- Wire eval callback to trainer ---
