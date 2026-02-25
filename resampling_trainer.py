@@ -1,46 +1,34 @@
-"""ResamplingGRPOTrainer: resamples completions that hit max_completion_length.
+"""TruncationDroppingTrainer: drops truncated completions to save memory.
 
-When a completion is truncated (doesn't end with an EOS token), it gets
-resampled up to `max_resample_retries` times via vLLM. Any still-truncated
-after retries have their loss zeroed via mask_truncated_completions.
+Replaces truncated completions (those hitting max_completion_length) with
+a minimal 1-token stub. This shrinks the padded batch tensor from
+[batch, max_completion_length] to [batch, max_non_truncated_length],
+preventing OOM on long-sequence batches.
+
+mask_truncated_completions=True zeros their loss so they don't affect training.
+The stub keeps the first token (non-EOS) so TRL still detects it as truncated.
 """
-
-import math
 
 import torch
 import wandb
 from trl import GRPOTrainer
-from vllm import SamplingParams
-
-
-def _sanitize_logprob(logprob):
-    """Extract logprob value, returning None for NaN."""
-    value = logprob.logprob
-    if math.isnan(value):
-        return None
-    return value
 
 
 class ResamplingGRPOTrainer(GRPOTrainer):
-    """GRPOTrainer that resamples truncated completions before scoring.
+    """GRPOTrainer that drops truncated completions to save memory.
 
     Overrides _generate() to detect completions that hit max_completion_length
-    (no EOS token at end), resample them via vLLM, and splice replacements in.
-    Falls back to mask_truncated_completions=True for any still-truncated.
+    (no EOS token at end) and replace them with 1-token stubs. This shrinks
+    the padded batch tensor, preventing OOM. mask_truncated_completions=True
+    zeros loss for these stubs.
     """
 
-    def __init__(self, *args, max_resample_retries=3, **kwargs):
+    def __init__(self, *args, max_resample_retries=None, **kwargs):
+        # max_resample_retries accepted for config compat but unused
+        kwargs.pop("max_resample_retries", None)
         super().__init__(*args, **kwargs)
-        self.max_resample_retries = max_resample_retries
-        # Fallback: zero loss for completions still truncated after retries
+        # Zero loss for truncated (now stubbed) completions
         self.mask_truncated_completions = True
-
-        # Resampling requires direct access to vLLM LLM instance (colocate only)
-        if not hasattr(self, "vllm_generation") or not hasattr(self.vllm_generation, "llm"):
-            raise ValueError(
-                "ResamplingGRPOTrainer requires vllm_mode='colocate'. "
-                "Server mode is not supported."
-            )
 
         # Build EOS token set from tokenizer + config (not hardcoded)
         self._eos_tokens = set()
@@ -76,96 +64,41 @@ class ResamplingGRPOTrainer(GRPOTrainer):
         if not truncated_indices:
             return result
 
-        initial_truncated = len(truncated_indices)
+        num_truncated = len(truncated_indices)
         total_completions = len(completion_ids)
+        max_before = max(len(ids) for ids in completion_ids)
 
-        # Build SamplingParams matching training config
-        stop_ids = self.args.generation_kwargs.get("stop_token_ids", [])
-        sampling_params = SamplingParams(
-            n=1,
-            temperature=self.args.temperature,
-            top_p=self.args.top_p,
-            max_tokens=self.args.max_completion_length,
-            stop_token_ids=stop_ids,
-            logprobs=0,
-        )
+        # Replace truncated completions with 1-token stub
+        # Keep first token (non-EOS) so TRL still detects as truncated → mask zeros loss
+        for idx in truncated_indices:
+            completion_ids[idx] = [completion_ids[idx][0]]
+            completions[idx] = ""
+            if logprobs is not None and logprobs[idx]:
+                logprobs[idx] = [logprobs[idx][0]]
+            if tool_mask is not None and tool_mask[idx]:
+                tool_mask[idx] = [tool_mask[idx][0]]
 
-        # Resample up to K times
-        for retry in range(self.max_resample_retries):
-            if not truncated_indices:
-                break
+        max_after = max(len(ids) for ids in completion_ids)
 
-            # Build token-based prompts for truncated completions
-            # Use int() to handle both plain lists and tensor elements
-            resample_prompts = [
-                {"prompt_token_ids": [int(t) for t in prompt_ids[i]]}
-                for i in truncated_indices
-            ]
-
-            # Call vLLM directly (weights already synced by super()._generate)
-            outputs = self.vllm_generation.llm.generate(
-                resample_prompts,
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
-
-            # Splice results back in
-            still_truncated = []
-            for j, idx in enumerate(truncated_indices):
-                output = outputs[j].outputs[0]
-                new_ids = list(output.token_ids)
-
-                # Decode with same method as TRL's _generate
-                new_text = self.processing_class.decode(new_ids, skip_special_tokens=True)
-
-                # Extract logprobs
-                new_lps = None
-                if output.logprobs:
-                    new_lps = [
-                        _sanitize_logprob(next(iter(lp.values())))
-                        for lp in output.logprobs
-                    ]
-
-                # Update in-place
-                completion_ids[idx] = new_ids
-                completions[idx] = new_text
-                if logprobs is not None and new_lps is not None:
-                    logprobs[idx] = new_lps
-
-                if self._is_truncated(new_ids):
-                    still_truncated.append(idx)
-
-            truncated_indices = still_truncated
-
-            print(
-                f"[Resample retry {retry + 1}/{self.max_resample_retries}] "
-                f"{len(still_truncated)} still truncated"
-            )
-
-        # Recompute total_completion_tokens (distributed-aware)
+        # Recompute total_completion_tokens
         completion_lengths = torch.tensor(
             [len(ids) for ids in completion_ids],
             device=self.accelerator.device,
         )
         total_completion_tokens = self.accelerator.gather(completion_lengths).sum()
 
-        # Log resampling stats
-        final_truncated = len(truncated_indices)
-        resampled_ok = initial_truncated - final_truncated
-
         print(
-            f"[Resample] {initial_truncated}/{total_completions} truncated -> "
-            f"{resampled_ok} resampled OK, {final_truncated} still truncated"
+            f"[Drop truncated] {num_truncated}/{total_completions} dropped "
+            f"(max seq: {max_before} -> {max_after})"
         )
 
         try:
             wandb.log(
                 {
-                    "resample/initial_truncated": initial_truncated,
-                    "resample/initial_truncated_frac": initial_truncated / total_completions,
-                    "resample/resampled_ok": resampled_ok,
-                    "resample/still_truncated": final_truncated,
-                    "resample/still_truncated_frac": final_truncated / total_completions,
+                    "truncation/num_dropped": num_truncated,
+                    "truncation/frac_dropped": num_truncated / total_completions,
+                    "truncation/max_seq_before": max_before,
+                    "truncation/max_seq_after": max_after,
                 },
                 commit=False,
             )
